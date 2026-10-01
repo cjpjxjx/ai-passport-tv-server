@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-本文档为 Claude Code 提供指导，帮助在开发 **ai-passport-tv-server** 时理解项目上下文、设计原则与开发约束。定位：AI Passport TV 设备的局域网媒体服务器，把直播频道实时转码为设备可绘制的调色板索引画面与 PCM 音频，经 FAV1 协议推流。
+本文档为 Claude Code 提供指导，帮助在开发 **ai-passport-tv-server** 时理解项目上下文、设计原则与开发约束。定位：AI Passport TV 设备的局域网媒体服务器，把直播频道实时转码为设备可绘制的调色板索引画面与 IMA ADPCM 音频，经 FAV1 协议推流。
 
 无论用户输入包含哪种语言，包括英文代码、报错信息或专业术语，都用简体中文回答和解释；仅当用户明确要求"用英语回答"或"翻译"时才使用其他语言。
 
@@ -15,7 +15,7 @@
 > [README.md](README.md) 面向使用者，讲功能、配置与使用方法；本文件面向开发，讲设计决策与操作性约束。两者冲突时以 README.md 为准，并同步修订本文件。
 ## 项目概述
 
-Python 标准库实现的单客户端局域网服务器，不是公网代理或带完整鉴权的服务。设备按频道名连接，服务端为每个会话启动一个 ffmpeg 进程，同时解码音视频，视频缩放并量化到固定 3-3-2 调色板后按条带 deflate 压缩，音频转 16 kHz 单声道 PCM，按设备音频时钟调度发送。
+Python 标准库实现的单客户端局域网服务器，不是公网代理或带完整鉴权的服务。设备按频道名连接，服务端为每个会话启动一个 ffmpeg 进程，同时解码音视频，视频缩放并量化到固定 3-3-2 调色板后按条带 deflate 压缩，音频转 16 kHz 单声道 PCM 后编码为 IMA ADPCM，按设备音频时钟调度发送。
 
 - **直播转码与会话**：频道表加载、ffmpeg 命令构造、队列与预缓冲，见 [server/live.py](server/live.py)。
 - **会话与发送调度**：监听、握手鉴权、直播会话、包调度，见 [server/tv_server.py](server/tv_server.py)。
@@ -28,7 +28,7 @@ Python 标准库实现的单客户端局域网服务器，不是公网代理或�
 
 以下条目来自固件 `208357b` 的记录并与本仓库代码核对，设备不在本仓库，无法在本地验证。
 
-1. **【MUST】固件契约同步修改** —— 下列任一项只能与固件同时修改，否则会话被重置、屏幕显示彩条：调色板 256 项（`frames.PALETTE_ENTRIES`）；画面几何与条带行数（`frames.GEOMETRIES`，默认 320x180、12 行、15 条带，`CONFIG` 带 `stripe_rows` 供设备校验）；单个压缩条带不超过 4096 字节；视频包不超过 `frames.VIDEO_MAX`；`CONFIG` 的 `fps` 为 1..30；频道数与频道 id 长度上限（`live.TV_CHANNEL_MAX`、`live.TV_CHANNEL_ID_MAX`）。
+1. **【MUST】固件契约同步修改** —— 下列任一项只能与固件同时修改，否则会话被重置、屏幕显示彩条：调色板 256 项（`frames.PALETTE_ENTRIES`）；画面几何与条带行数（`frames.GEOMETRIES`，默认 320x180、12 行、15 条带，`CONFIG` 带 `stripe_rows` 供设备校验）；单个压缩条带不超过 4096 字节；视频包不超过 `frames.VIDEO_MAX`；`CONFIG` 的 `fps` 为 1..30；频道数与频道 id 长度上限（`live.TV_CHANNEL_MAX`、`live.TV_CHANNEL_ID_MAX`）；音频包为 IMA ADPCM，324 字节 640 采样，`CONFIG` 带 `audio_codec`（`protocol.AUDIO_BYTES`、`adpcm`）。
 
 2. **【MUST】设备约 3 秒收不到数据即断开重连** —— 音频断流超过该时限会结束会话。发送以完整 FAV1 包为界，视频大包分片写入（`tv_server.VIDEO_SLICE_BYTES`），视频晚于呈现时刻则丢弃，不得为视频阻塞音频。
 
@@ -61,7 +61,7 @@ Python 标准库实现的单客户端局域网服务器，不是公网代理或�
 - **【MUST】** 异常信息、日志不包含 token、HELLO 载荷与对端数据。
 - **【SHOULD】** 使用类型注解，文件头保留 `from __future__ import annotations`。
 - **【SHOULD】** 函数和类添加简短的 docstring，注释密度与同文件其它同类条目保持一致。
-- **【SHOULD】** 新增第三方依赖前先评估必要性；运行只依赖标准库，`numpy` 为可选依赖，同步更新 [requirements.txt](requirements.txt)。
+- **【SHOULD】** 新增第三方依赖前先评估必要性；默认降质方式 `perceptual` 依赖 `numpy`，`TV_DEGRADE=ladder` 只依赖标准库，同步更新 [requirements.txt](requirements.txt)。
 - **【MUST】** 面向用户的控制台提示用简体中文，代码注释与 docstring 用英文。
 - **【MUST】** `.py`、`.md` 用 UTF-8，换行符用 LF。
 
@@ -88,14 +88,17 @@ README.md、CLAUDE.md 及代码注释遵守：
 
 - **[server/tv_server.py](server/tv_server.py)** —— `AVServer.serve`（监听与单客户端接入）、`_live_session`（直播会话：CONFIG、PALETTE、帧发送）、`_pace_live`（发送调度循环）、`load_token` / `authenticate`（令牌鉴权）、`main`（唯一子命令 `live`）。涉及命令行参数、令牌、握手、发送节奏时看这里。
 - **[server/protocol.py](server/protocol.py)** —— `Kind`、`Packet`、`send_packet`、`receive_packet`：24 字节包头、类型、长度上限、整包超时。涉及线协议字段与限长时看这里。
-- **[server/frames.py](server/frames.py)** —— `GEOMETRIES`、`compress_stripes`、`choose_stripes`、`encode_within`、`pack_stripes`、`input_options`、`palette_bytes`：几何、条带、增量、字节预算、ffmpeg 输入参数。涉及画面格式、包大小、压缩时看这里。
+- **[server/frames.py](server/frames.py)** —— `GEOMETRIES`、`compress_stripes`、`choose_stripes`、`fill_stripes`、`encode_within`、`pack_stripes`、`input_options`、`palette_bytes`：几何、条带、增量、字节预算、ffmpeg 输入参数。涉及画面格式、包大小、压缩时看这里。
 - **[server/live.py](server/live.py)** —— `parse_channels` / `load_channels`（频道表）、`LiveChannel`（单频道会话：两路队列、预缓冲、对齐）、`source_command`（ffmpeg 命令）、`probe_source_fps`。涉及频道表、ffmpeg 参数、队列与预缓冲、音画对齐时看这里。
 - **[server/timeline.py](server/timeline.py)** —— `ContentTimeline`、`SessionClock`、`SourceState`：内容时间轴与源状态判断。
 - **[server/pts.py](server/pts.py)** —— `Timestamps`、`Reader`：解析 ffmpeg `showinfo` / `ashowinfo` 输出的 pts。
+- **[server/reconnect.py](server/reconnect.py)** —— `hold`、`Restart`、`WireState`：上游断流时的提示画面、静音补发与 ffmpeg 重启。涉及断流恢复、会话保持时看这里。
+- **[server/overlay.py](server/overlay.py)** —— `reconnect_frame`：在索引画面上绘制提示文字。
 - **[server/rate.py](server/rate.py)** —— `ByteRate`：字节率与自适应，无 IO。涉及字节预算、自适应时看这里。
-- **[server/perceptual.py](server/perceptual.py)** —— `encode_within`：帧超出字节目标时的感知取舍，依赖 numpy。
+- **[server/perceptual.py](server/perceptual.py)** —— `encode_within`：帧超出字节目标时的降质，模式 `perceptual`、`perceptual_2d`、`mosaic`，依赖 numpy。
 - **[server/media.py](server/media.py)** —— 时序常量（`FPS`、`AUDIO_LEAD_MS`、`VIDEO_LEAD_MS`、`START_DELAY_MS`）与固定调色板 `default_palette`。
 - **[server/netident.py](server/netident.py)** —— `lan_address`、`local_name`、`describe`：启动时打印设备应填写的地址与 `.local` 名称。
+- **[server/adpcm.py](server/adpcm.py)** —— `Encoder`、`decode`：音频块的 IMA ADPCM 编码（头部为块前状态，较早采样在低半字节）。
 - **[tools/log_stamp.py](tools/log_stamp.py)** —— 给标准输入逐行加时间戳并按天写日志。
 
 运行时调参环境变量均以 `TV_` 开头，用 `grep -n 'environ.get("TV_' server/*.py` 查看名称与默认值。
@@ -124,9 +127,11 @@ README.md、CLAUDE.md 及代码注释遵守：
 
 两者独立设置。音频提前量决定设备端队列深度；240 秒扫描中 200 ms 出现 10 次欠载，320 ms 无欠载无丢帧，400 ms 丢帧 39 个（实测）。视频提前量加到 320 ms 会与音频挤在一起，丢帧显著增多。
 
-### 6. 帧率默认固定，自适应为可选
+### 6. 帧率固定，字节目标逐帧套用，自适应为可选
 
 `TV_ADAPTIVE` 默认关闭，字节率固定；开启后 `ByteRate` 按写入耗时调整字节率，帧率不变。直播帧率取自 ffprobe 探测的源帧率，`TV_FPS` 显式设置时覆盖探测。
+
+每帧字节目标为 `rate / fps`（`TV_FRAME_BYTES` 默认 20000 字节每帧）。帧先原样尝试，放不下才按 `TV_DEGRADE` 逐档降质，仍放不下按变化量丢条带；放进后 `TV_ENCODE=fill` 用剩余字节补发被跳过的条带，不触发更多降质。目标不是绝对上限（合成噪声实测）：首帧全发；强制刷新的条带不受目标限制；目标不含每包 24 字节包头。强制刷新用于修复设备丢失的条带；整帧全零长度条带时设备的行为未验证，不要去掉。
 
 ### 7. 一个 ffmpeg 进程产出音视频，经回环 TCP 输出
 
@@ -135,6 +140,14 @@ README.md、CLAUDE.md 及代码注释遵守：
 ### 8. 无令牌也可运行
 
 未配置令牌时不校验 HELLO 内容，仅检查 HELLO 形状，并在控制台提示同网段设备均可收看。配置令牌后严格校验。
+
+### 9. 上游断流时保持会话
+
+源停供（ffmpeg 退出、卡住、起播打不开）时会话不结束：设备显示最后一帧叠加 `RECONNECTING...`（起播前为纯蓝底），服务端持续补发静音块（324 个零字节，解码为精确静音）以满足设备音频看门狗，并在工作线程重启 ffmpeg；新源预缓冲完成后接续发送，断开期间的内容跳过，不回补。`start()` 阻塞数秒，因此重启必须在线程中进行，否则静音中断。
+
+发送时间戳 = 频道时间戳 + `stamp_base`，使静音与新进程的时间轴接续设备要求的"音频时间戳严格递增一个块长"；视频时间戳发送前钳制为严格递增。叠字用内置 5x7 点阵，不支持中文。持续 `TV_RECONNECT_TIMEOUT_S`（默认 60）秒仍无数据，发 ERROR 并结束会话。
+
+已实测（本地文件与回环 TCP 模拟源）：包序号、音频与视频时间戳无违规，断流期间无超过 1 秒的数据空档；未在真实设备上验证。
 
 ## 配置与凭证约束
 
@@ -152,15 +165,11 @@ python -m server.tv_server live --channel <频道 id> --bind <局域网 IPv4> --
 python -u -m server.tv_server live --channel <频道 id> 2>&1 | python tools/log_stamp.py server
 ```
 
-没有 Docker 部署。频道表只在启动时读取一次，修改后重启服务。
-
-### 测试与检查
-
-没有配置测试、lint、类型检查或构建流程；发送节奏与画面格式的改动用真实设备验证。
+没有 Docker 部署。频道表只在启动时读取一次，修改后重启服务。没有配置测试、lint、类型检查或构建流程；发送节奏、画面格式、音频的改动用真实设备验证。
 
 ## 实现状态
 
-- **已实现**：直播转码与 FAV1 推流、令牌鉴权、频道表、增量条带、可选的自适应帧率与感知取舍。
+- **已实现**：直播转码与 FAV1 推流、令牌鉴权、频道表、增量条带、逐帧字节目标（4 种降质方式、2 种条带选择、5 种缩放算法）、IMA ADPCM 音频、可选的自适应字节率、上游断流时的提示画面与自动重连。
 - **范围**：只支持直播频道，没有预生成素材与本地视频文件导入。
 - **已知缺陷**：`load_token` 使用 Windows 不存在的 `os.O_NONBLOCK` 与 `os.getuid`，Windows 上 `--token-file` 不可用（实测）。
 

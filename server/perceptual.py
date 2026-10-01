@@ -10,6 +10,12 @@ reference pixel's, so deflate sees more repeats and the picture loses detail
 gradually. How close is a threshold searched per frame, starting from the level
 the previous frame needed.
 
+Three modes share the same per-frame level search:
+
+- `perceptual`: reuse the held value or the left neighbour.
+- `perceptual_2d`: as above, and also the neighbour above.
+- `mosaic`: every N x N block takes the colour of its top-left pixel.
+
 Needs numpy for speed; `AVAILABLE` says whether it imported.
 """
 
@@ -33,6 +39,11 @@ WIDTH, HEIGHT = frames.WIDTH, frames.HEIGHT
 # the reference itself.
 LEVELS = (0, 3900, 7800, 11700, 15600, 23400, 31200, 46800, 70000, 110000)
 
+# Block edge in pixels for each mosaic level; level 0 is the reference itself.
+MOSAIC_BLOCKS = (1, 2, 3, 4, 5, 6, 10)
+
+MODES = ("perceptual", "perceptual_2d", "mosaic")
+
 if AVAILABLE:
     # The palette both ends implement: red and green in steps of 36, blue in steps
     # of 85 (frames.palette_bytes documents where those numbers come from), with
@@ -43,13 +54,15 @@ if AVAILABLE:
 
 
 def _snap(reference: "np.ndarray", base: "np.ndarray", shown: "np.ndarray | None",
-          held_distance: "np.ndarray | None", threshold: float) -> "np.ndarray":
+          held_distance: "np.ndarray | None", threshold: float,
+          vertical: bool = False) -> "np.ndarray":
     """`base` with pixels replaced by a cheaper index that is close enough.
 
     First the value the device already holds, wherever it is within `threshold`
-    of the reference; then, column by column, the pixel to the left. Both make the
-    stripe repeat itself, which is all deflate needs. The left pass is sequential
-    on purpose: a pixel may copy a neighbour that itself just copied its own.
+    of the reference; then, column by column, the pixel to the left; with
+    `vertical`, finally row by row, the pixel above. All make the stripe repeat
+    itself, which is all deflate needs. The neighbour passes are sequential on
+    purpose: a pixel may copy a neighbour that itself just copied its own.
     """
     out = base.copy()
     if shown is not None:
@@ -62,12 +75,25 @@ def _snap(reference: "np.ndarray", base: "np.ndarray", shown: "np.ndarray | None
         gap = _PALETTE_W[left] - source[x]
         near = (np.einsum("ij,ij->i", gap, gap) <= threshold) & (columns[x] != left)
         np.copyto(columns[x], left, where=near)
-    return np.ascontiguousarray(columns.T)
+    out = np.ascontiguousarray(columns.T)
+    if vertical:
+        for y in range(1, HEIGHT):
+            up = out[y - 1]
+            gap = _PALETTE_W[up] - reference[y]
+            near = (np.einsum("ij,ij->i", gap, gap) <= threshold) & (out[y] != up)
+            np.copyto(out[y], up, where=near)
+    return out
+
+
+def _mosaic(base: "np.ndarray", block: int) -> "np.ndarray":
+    """`base` with every `block` x `block` square filled with its top-left pixel."""
+    small = base[::block, ::block]
+    return np.repeat(np.repeat(small, block, axis=0), block, axis=1)[:HEIGHT, :WIDTH]
 
 
 def encode_within(raw: bytes, shown: bytes | None, tick: int, target: int,
-                  hint: int = 0,
-                  min_diff: float = frames.DELTA_MAX_DIFF) -> tuple[list[bytes], bytes, int]:
+                  hint: int = 0, min_diff: float = frames.DELTA_MAX_DIFF,
+                  mode: str = "perceptual") -> tuple[list[bytes], bytes, int]:
     """Same contract as `frames.encode_within`: (stripes to send, what they draw, level).
 
     Level 0 is the frame as it came, and is always tried first, so a frame that
@@ -75,14 +101,22 @@ def encode_within(raw: bytes, shown: bytes | None, tick: int, target: int,
     is back at full detail at once. Otherwise the search starts at `hint`, the level
     the previous frame needed, because frames that need one come in runs: if it
     fits, one level lower is tried, and if not, the levels above it are bisected.
+    `mode` is one of `MODES` and decides how a level turns into a picture.
     """
     if len(raw) != frames.FRAME_PIXELS:
         raise ValueError(f"frame is {len(raw)} bytes, expected {frames.FRAME_PIXELS}")
-    top = len(LEVELS) - 1
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}")
+    top = (len(MOSAIC_BLOCKS) if mode == "mosaic" else len(LEVELS)) - 1
+
+    def render(level: int) -> bytes:
+        if mode == "mosaic":
+            return _mosaic(base, MOSAIC_BLOCKS[level]).tobytes()
+        return _snap(reference, base, held, held_distance, LEVELS[level],
+                     vertical=mode == "perceptual_2d").tobytes()
 
     def attempt(level: int):
-        drawn = raw if level == 0 else _snap(reference, base, held, held_distance,
-                                             LEVELS[level]).tobytes()
+        drawn = raw if level == 0 else render(level)
         return frames.choose_stripes(drawn, shown, tick, 1 << 30, min_diff), drawn
 
     def fits(result) -> bool:

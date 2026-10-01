@@ -23,7 +23,11 @@ CONTROL_MAX = 24 * 1024
 # where that number is derived. Kept as an import rather than a second literal
 # so the two cannot drift apart.
 from .frames import VIDEO_MAX
-AUDIO_BYTES = 1280
+# What ffmpeg writes for one 40 ms block: 640 samples of s16le mono.
+AUDIO_PCM_BYTES = 1280
+# What goes on the wire for that block: a 4-byte IMA ADPCM header and 640 nibbles
+# (server/adpcm.py). Must equal AV_AUDIO_BYTES in main/av_protocol.h.
+AUDIO_BYTES = 324
 UINT32_MAX = 0xFFFFFFFF
 IO_TIMEOUT = 0.25
 

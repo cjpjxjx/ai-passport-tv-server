@@ -317,6 +317,36 @@ def choose_stripes(raw: bytes, shown: bytes | None, tick: int, allowed: int,
     return out
 
 
+def fill_stripes(raw: bytes, shown: bytes | None, chosen: list[bytes],
+                 allowed: int) -> list[bytes]:
+    """`chosen` plus the skipped stripes that still fit in `allowed` bytes.
+
+    Run after the picture has been fitted to the budget, so it only spends what
+    that left over and never forces a coarser picture. Stripes that differ from
+    `shown` go in biggest change first; identical ones are not worth bytes.
+    """
+    if shown is None:
+        return chosen
+    spent = _wire_size(chosen)
+    ranked = []
+    for at in range(STRIPES):
+        if chosen[at]:
+            continue
+        lo, hi = at * STRIPE_PIXELS, (at + 1) * STRIPE_PIXELS
+        changed = differing_pixels(raw[lo:hi], shown[lo:hi])
+        if changed:
+            ranked.append((-changed, at))
+    ranked.sort()
+    out = list(chosen)
+    for _, at in ranked:
+        z = _deflate(raw, at)
+        if spent + len(z) > allowed:
+            continue
+        out[at] = z
+        spent += len(z)
+    return out
+
+
 def apply_stripes(raw: bytes, shown: bytes | None, sent: list[bytes]) -> bytes:
     """What the device shows after receiving `sent`: `shown` with those stripes of
     `raw` written over it."""
@@ -483,7 +513,11 @@ def palette_bytes(rgb24: bytes) -> bytes:
 # they could find, which was white. The bars above and below the picture came
 # out white and the whole panel looked lit. Deriving both from one string is
 # what stops that from being possible again.
-SCALER_FLAGS = os.environ.get("TV_SCALER_FLAGS", "bicubic")
+SCALE_MODES = ("bicubic", "lanczos", "bilinear", "area", "neighbor")
+SCALE = os.environ.get("TV_SCALE", "").strip() or "bicubic"
+if SCALE not in SCALE_MODES:
+    raise SystemExit(f"TV_SCALE={SCALE!r} 无效，可选值：{' / '.join(SCALE_MODES)}")
+SCALER_FLAGS = SCALE
 FIT = (f"scale=iw*sar:ih,setsar=1,"
        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease:flags={SCALER_FLAGS},"
        f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1")

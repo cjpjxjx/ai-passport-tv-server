@@ -32,16 +32,12 @@ import threading
 import time
 from pathlib import Path
 
-from . import frames, pts
-try:
-    from . import perceptual
-except ImportError:
-    perceptual = None
+from . import adpcm, frames, perceptual, pts
 from .timeline import (BASIS_COMMON_DECODE, ContentTimeline,
                        SessionClock, SourceState, VERDICT_IN_HOLE,
                        VERDICT_PLACED)
 from .media import AUDIO_CHUNK_MS, FPS, default_palette
-from .protocol import AUDIO_BYTES, HEADER
+from .protocol import AUDIO_PCM_BYTES, HEADER
 # Device-side limits, mirroring main/av_protocol.h. A channel id the firmware
 # would skip must be rejected here instead, where it can be reported.
 TV_CONTROL_MAX = 7168
@@ -220,7 +216,7 @@ VIDEO_QUEUE_FRAMES = int(os.environ.get("TV_VIDEO_QUEUE",
 # figure is a setting rather than a constant, because two viewers will weigh it
 # differently.
 #
-#     TV_PREBUFFER_S=4   the default: two seconds either side of a channel change
+#     TV_PREBUFFER_S=3   the default: three seconds before a channel change shows
 #     TV_PREBUFFER_S=8   a slower change, more tolerance of a source that stalls
 #
 # Four rather than eight, and the reason is what the wait is actually for. The
@@ -240,7 +236,7 @@ VIDEO_QUEUE_FRAMES = int(os.environ.get("TV_VIDEO_QUEUE",
 # reserve deeper than either queue would never be reached and every session
 # would end at PREBUFFER_TIMEOUT_S reporting "no media from source" -- which
 # reads as a dead channel rather than as a setting that is too ambitious.
-PREBUFFER_SECONDS = min(float(os.environ.get("TV_PREBUFFER_S", "4")),
+PREBUFFER_SECONDS = min(float(os.environ.get("TV_PREBUFFER_S", "3")),
                         PCM_QUEUE_CHUNKS * AUDIO_CHUNK_MS / 1000,
                         VIDEO_QUEUE_FRAMES / FPS)
 PREBUFFER_CHUNKS = int(PREBUFFER_SECONDS * 1000 / AUDIO_CHUNK_MS)   # 20 ms each
@@ -455,11 +451,11 @@ class LiveError(RuntimeError):
 
 
 
-# Samples in one device block. The device takes 1280 bytes of s16 mono, so the
-# audio frame size is fixed to that rather than left to the resampler: it is
+# Samples in one device block. ffmpeg writes 1280 bytes of s16 mono per block, so
+# the audio frame size is fixed to that rather than left to the resampler: it is
 # what makes one `ashowinfo` line describe exactly one block, and the timestamps
 # are read one line per block.
-AUDIO_SAMPLES = AUDIO_BYTES // 2
+AUDIO_SAMPLES = AUDIO_PCM_BYTES // 2
 
 # One graph, two outputs, and the timestamps read out of the same graph.
 #
@@ -474,13 +470,24 @@ AUDIO_SAMPLES = AUDIO_BYTES // 2
 # `ashowinfo` line would cover two blocks and every timestamp after the first
 # would be paired with the wrong payload.
 PRE_FILTER = os.environ.get("TV_PRE_FILTER", "").strip()
-# What is done with a frame that does not fit its byte target. On, it gives detail
-# up perceptually (server/perceptual.py); off, or without numpy, it steps through
-# the colour ladder (frames.encode_within). A frame that fits is sent as ffmpeg
-# made it either way.
-PERCEPTUAL = (perceptual is not None and perceptual.AVAILABLE
-              and os.environ.get("TV_PERCEPTUAL", "1") != "0")
+# How a frame that does not fit its byte target is degraded: the modes in
+# perceptual.MODES (server/perceptual.py, need numpy), or "ladder", which steps
+# through the colour ladder (frames.encode_within). A frame that fits is sent as
+# ffmpeg made it either way.
+DEGRADE_MODES = (*perceptual.MODES, "ladder")
+DEGRADE = os.environ.get("TV_DEGRADE", "").strip() or "perceptual"
+if DEGRADE not in DEGRADE_MODES:
+    raise SystemExit(f"TV_DEGRADE={DEGRADE!r} 无效，可选值：{' / '.join(DEGRADE_MODES)}")
+if DEGRADE in perceptual.MODES and not perceptual.AVAILABLE:
+    raise SystemExit(f"TV_DEGRADE={DEGRADE} 需要 numpy，请先安装（pip install -r requirements.txt）")
 _VIDEO_CHAIN = f"{frames.FIT},{PRE_FILTER}" if PRE_FILTER else frames.FIT
+# What is done with the byte budget a frame leaves over once it fits: "delta"
+# sends only the stripes that changed by more than TV_DELTA_MAX_DIFF, "fill" also
+# sends skipped stripes, biggest change first, for as long as they fit.
+ENCODE_MODES = ("delta", "fill")
+ENCODE = os.environ.get("TV_ENCODE", "").strip() or "delta"
+if ENCODE not in ENCODE_MODES:
+    raise SystemExit(f"TV_ENCODE={ENCODE!r} 无效，可选值：{' / '.join(ENCODE_MODES)}")
 def source_graph(fps: int) -> str:
     """The filter graph for a source whose picture is to be produced at `fps`."""
     return (
@@ -715,6 +722,7 @@ class LiveChannel:
         self._audio: object | None = None
         self._video_sock: socket.socket | None = None
         self._audio_sock: socket.socket | None = None
+        self._adpcm = adpcm.Encoder()
         self._raw_video: queue.Queue[bytes | None] = queue.Queue(maxsize=120)
         self._raw_audio: queue.Queue[bytes | None] = queue.Queue(maxsize=300)
         # The colours the device needs before it can draw anything. Filled in by
@@ -747,6 +755,24 @@ class LiveChannel:
         """
         self.palette = default_palette()
         return self.palette
+
+    def _accept_decoder(self, listener: socket.socket) -> socket.socket:
+        """The decoder's connection, failing at once if the decoder has exited.
+
+        A source that cannot be opened makes ffmpeg exit without ever connecting,
+        so waiting out the whole timeout would only delay the failure.
+        """
+        deadline = time.monotonic() + DECODER_CONNECT_TIMEOUT_S
+        listener.settimeout(0.1)
+        while True:
+            try:
+                return listener.accept()[0]
+            except socket.timeout:
+                pass
+            if self.decoder is not None and self.decoder.poll() is not None:
+                raise ConnectionAbortedError("decoder exited")
+            if time.monotonic() > deadline:
+                raise TimeoutError("decoder connect timeout")
 
     def start(self) -> None:
         if self.palette is None:
@@ -803,11 +829,9 @@ class LiveChannel:
             # starting, well before it has decoded anything from the source, so
             # a timeout here catches a decoder that failed to launch rather
             # than a slow channel.
-            video_listener.settimeout(DECODER_CONNECT_TIMEOUT_S)
-            audio_listener.settimeout(DECODER_CONNECT_TIMEOUT_S)
             try:
-                video_sock, _ = video_listener.accept()
-                audio_sock, _ = audio_listener.accept()
+                video_sock = self._accept_decoder(video_listener)
+                audio_sock = self._accept_decoder(audio_listener)
             except OSError as error:
                 raise LiveError(
                     f"decoder did not connect: {type(error).__name__}") from None
@@ -934,8 +958,8 @@ class LiveChannel:
         """Drain raw audio blocks immediately from ffmpeg audio pipe."""
         try:
             while not self.stop.is_set():
-                block = frames.read_exactly(self._audio, AUDIO_BYTES)
-                if len(block) != AUDIO_BYTES:
+                block = frames.read_exactly(self._audio, AUDIO_PCM_BYTES)
+                if len(block) != AUDIO_PCM_BYTES:
                     if not self.stop.is_set():
                         self._raw_audio.put(None)
                     break
@@ -959,7 +983,7 @@ class LiveChannel:
                     if self.stop.is_set():
                         break
                     raise LiveError("transcode audio pipe closed")
-                self._push_audio(block, self._decoder_time("audio"))
+                self._push_audio(self._adpcm.encode_pcm(block), self._decoder_time("audio"))
         except (LiveError, OSError, ValueError, pts.Misaligned) as error:
             self._note(error)
 
@@ -1251,13 +1275,16 @@ class LiveChannel:
         if raw is None:
             return packets
         started = time.monotonic()
-        if PERCEPTUAL:
+        if DEGRADE in perceptual.MODES:
             chosen, drawn, rung = perceptual.encode_within(
-                raw, self._shown, self._delta_tick, self._budget.target(), self._snap_level)
+                raw, self._shown, self._delta_tick, self._budget.target(), self._snap_level,
+                mode=DEGRADE)
             self._snap_level = rung
         else:
             chosen, drawn, rung = frames.encode_within(raw, self._shown, self._delta_tick,
                                                        self._budget.target())
+        if ENCODE == "fill":
+            chosen = frames.fill_stripes(drawn, self._shown, chosen, self._budget.target())
         self._delta_tick += 1
         self._shown = frames.apply_stripes(drawn, self._shown, chosen)
         out = frames.pack_stripes(chosen)
@@ -1294,6 +1321,17 @@ class LiveChannel:
             self._video_advanced = False
             self._audio_advanced = False
             return state
+
+    @property
+    def shown(self) -> bytes | None:
+        """The picture the device currently shows, or None before the first frame."""
+        with self.lock:
+            return self._shown
+
+    @shown.setter
+    def shown(self, picture: bytes | None) -> None:
+        with self.lock:
+            self._shown = picture
 
     def has_data(self) -> bool:
         with self.lock:

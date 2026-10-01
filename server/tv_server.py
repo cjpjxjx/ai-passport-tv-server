@@ -39,6 +39,7 @@ from .media import (AUDIO_CHUNK_MS, AUDIO_LEAD_MS, DURATION_MS, FPS,
 from .protocol import (IO_TIMEOUT, VIDEO_CONTINUES, Kind, Packet,
                        ProtocolError, json_bytes, json_object, receive_packet,
                        send_packet, _write_slice)
+from . import reconnect
 
 # The name of the environment variable an operator can set instead of
 # --token-file. Renamed with everything else on this side: it is the server's
@@ -52,7 +53,8 @@ TOKEN_ENV = "TV_PAIRING_TOKEN"
 # unified, so the device was told a timing that no longer matched the sender.
 CONFIG = {"width": frames.WIDTH, "height": frames.HEIGHT, "fps": FPS,
           "sample_rate": 16000,
-          "channels": 1, "sample_bits": 16, "audio_chunk_ms": AUDIO_CHUNK_MS,
+          "channels": 1, "sample_bits": 16, "audio_codec": "ima_adpcm",
+          "audio_chunk_ms": AUDIO_CHUNK_MS,
           "video_max_bytes": frames.VIDEO_MAX,
           # The two values the device checks its own geometry against. Sending
           # them means a server and a firmware that disagree refuse to talk,
@@ -125,6 +127,10 @@ VIDEO_SLICE_BYTES = 4096
 # packets shows 60 to 430 ms writes. Set it to 0 to report every write, or to a
 # large number to turn the line off.
 PROBE_SLOW_S = float(os.environ.get("TV_PROBE_SLOW_S", "0.05"))
+
+# How long a new session waits for its first media before the device is held on
+# the reconnect notice.
+STARTUP_WAIT_S = min(PREBUFFER_TIMEOUT_S, 10)
 
 
 WILDCARD_BIND = "0.0.0.0"
@@ -248,6 +254,7 @@ class AVServer:
         self.ffmpeg = "ffmpeg"
         # Injectable so the pacing loop can be tested without ffmpeg or network.
         self.channel_factory = LiveChannel
+        self.frame_deadline_s = FRAME_WRITE_DEADLINE_S
         self.logger = logger or (lambda message: None)
         self.session_state: SessionState = SessionState.CLOSED
         self.state_history: List[Dict[str, Any]] = []
@@ -474,6 +481,11 @@ class AVServer:
                 return True
         return False
 
+    def make_channel(self) -> LiveChannel:
+        """A new, unstarted channel for the session's own channel id."""
+        return self.channel_factory(CHANNELS[self.channel_name], self.ffmpeg,
+                                    CHANNEL_AGENTS.get(self.channel_name, ""))
+
     def _live_session(self, connection: socket.socket, channel_id: str) -> None:
         """Pace one live channel against a single monotonic origin.
 
@@ -534,25 +546,28 @@ class AVServer:
                 raise LiveError("channel has no palette")
             # start() is inside the try: a failing Popen would otherwise leak its
             # pipes and stderr file on every reconnect attempt.
-            channel.start()
-            self.live_channel = channel
-            # A calibration that did not happen is reported where a person will
-            # see it, not merely stored on an object.
             #
-            # An external review made the distinction: `timeline.calibration_note`
-            # was being set and never surfaced, `start()` discarded the return
-            # value, `failure()` stayed None and `prebuffered()` only counts
-            # queue length -- so "the server knows ffprobe is missing" and "the
-            # operator can find out" were two different facts.
-            #
-            # It is a WARNING and not a failure: sound and picture still flow,
-            # the picture simply has no verified session position. Refusing the
-            # session outright would turn a degraded mode into no service.
-            if not channel.timeline.calibrated:
-                self.logger(
-                    f"session={session} WARNING no clock calibration: "
-                    f"{channel.timeline.calibration_note}; the picture will not "
-                    f"be paired and no frames will be sent")
+            # A source that cannot start is not the end of the session: the
+            # device is held on the reconnect notice while it is retried.
+            failed = ""
+            try:
+                channel.start()
+            except (LiveError, OSError) as error:
+                self.logger(f"session={session} source start failed: {type(error).__name__}")
+                failed = "start_failed"
+            if not failed:
+                self.live_channel = channel
+                # A calibration that did not happen is reported where a person will
+                # see it, not merely stored on an object.
+                #
+                # It is a WARNING and not a failure: sound and picture still flow,
+                # the picture simply has no verified session position. Refusing the
+                # session outright would turn a degraded mode into no service.
+                if not channel.timeline.calibrated:
+                    self.logger(
+                        f"session={session} WARNING no clock calibration: "
+                        f"{channel.timeline.calibration_note}; the picture will not "
+                        f"be paired and no frames will be sent")
             # The palette follows CONFIG and precedes every frame. It belongs to
             # this channel: a viewer changing channel gets a new one, which is
             # why it is sent per session rather than once at connection.
@@ -560,17 +575,11 @@ class AVServer:
                                            channel.palette))
             self.logger(f"session={session} state=live channel={channel_id}")
             self.phase = "live_prebuffer"
-            deadline = time.monotonic() + PREBUFFER_TIMEOUT_S
-            while not channel.prebuffered() and time.monotonic() < deadline:
+            deadline = time.monotonic() + STARTUP_WAIT_S
+            while not failed and not channel.prebuffered() and time.monotonic() < deadline:
                 if channel.failure():
-                    # Same courtesy as below: say why, so the device can move on
-                    # rather than sit through its own timeout.
-                    try:
-                        send_packet(connection, Packet(Kind.ERROR, session, 0, 0,
-                                                       json_bytes({"reason": "source unavailable"})))
-                    except OSError:
-                        pass
-                    raise LiveError("transcode failed before prebuffer completed")
+                    failed = "decoder_stopped"
+                    break
                 # Poll the connection and the stop flag, not just the buffer.
                 # Sleeping the whole timeout here ignored an operator's stop for
                 # up to ten seconds and, worse, could not see the device give up
@@ -586,19 +595,21 @@ class AVServer:
                 self.phase = "live_prebuffer"
                 if not waiting:
                     return
-            if not channel.prebuffered():
-                # Tell the device why before dropping the connection. It hears the
-                # reason immediately instead of waiting out its own first-media
-                # allowance, which is how a dead source used to hold the screen on
-                # the test pattern for half a minute.
-                try:
-                    send_packet(connection, Packet(Kind.ERROR, session, 0, 0,
-                                                   json_bytes({"reason": "no media from source"})))
-                except OSError:
-                    pass
-                raise LiveError(f"no media within {PREBUFFER_TIMEOUT_S} s of starting the channel")
+            if not failed and not channel.prebuffered():
+                failed = "no_media"
+            resume = None
+            if failed:
+                wire = reconnect.WireState(seq=2, audio_pts=0)
+                now = time.monotonic()
+                channel = reconnect.hold(self, connection, session, channel, wire,
+                                         now + AUDIO_LEAD_MS / 1000, now,
+                                         restart_reason=failed)
+                if channel is None:
+                    return
+                self.live_channel = channel
+                resume = wire
             self.set_session_state(SessionState.PLAYING, session, reason="session_started")
-            self._pace_live(connection, channel, session)
+            self._pace_live(connection, channel, session, resume)
         finally:
             self.set_session_state(SessionState.CLOSED, session, reason="session_closed",
                                    audio_sent=self.audio_sent, video_sent=self.video_sent)
@@ -614,10 +625,15 @@ class AVServer:
                 except Exception as close_err:
                     self.logger(f"session={session} WARNING: channel close failed: {close_err}")
                 finally:
-                    self.live_channel = None
+                    live, self.live_channel = self.live_channel, None
+                    if live is not None and live is not channel:
+                        try:
+                            live.close()
+                        except Exception as close_err:
+                            self.logger(f"session={session} WARNING: channel close failed: {close_err}")
 
     def _pace_live(self, connection: socket.socket, channel: LiveChannel,
-                   session: int) -> None:
+                   session: int, resume: reconnect.WireState | None = None) -> None:
         # The origin must not precede "now" by more than the audio lead: ffmpeg
         # fills its queues far faster than real time, so a past-dated origin
         # would make the first slots due immediately and flush a burst of audio
@@ -710,6 +726,19 @@ class AVServer:
         seq = 2
         last_report = 0.0
         last_audio = last_video = 0
+        # Wire timestamps are the channel's own plus `stamp_base`. It is zero
+        # until the channel is replaced or the device has been sent notice
+        # frames and silence: those advance the device's clock without the
+        # channel knowing, so the channel's stamps are shifted to continue them.
+        stamp_base = 0
+        last_audio_wire = -AUDIO_CHUNK_MS
+        last_video_wire = -1
+        if resume is not None:
+            seq, audio_pts = resume.seq, resume.audio_pts
+            last_audio_wire, last_video_wire = resume.audio_stamp, resume.video_stamp
+            stamp_base = (last_audio_wire + AUDIO_CHUNK_MS
+                          - int(round(channel.session_clock.audio_items * AUDIO_CHUNK_MS)))
+            origin = time.monotonic() - (audio_pts - AUDIO_LEAD_MS) / 1000.0
         # The longest this loop went without putting anything on the wire, and
         # how much of the interval it spent writing.
         #
@@ -730,10 +759,62 @@ class AVServer:
                 max_send_gap = idle
             busy_us += took * 1e6
             gap_start = at
+
+        def hold_on_notice(empty_since: float) -> bool:
+            """Hold the device on the reconnect notice until a source has data again.
+
+            False when the session is over: the device left or a stop was asked for.
+            """
+            nonlocal channel, seq, audio_pts, origin, now, slot_now, last_slot, stamp_base
+            nonlocal last_audio_wire, last_video_wire, window_started, window_worst_write
+            nonlocal window_video_bytes, window_frames, window_dropped
+            self.set_session_state(
+                SessionState.STARVED_REBUFFERING,
+                session,
+                reason="channel_audio_empty",
+                empty_since=round(empty_since, 4)
+            )
+            wire = reconnect.WireState(seq, audio_pts, last_audio_wire, last_video_wire)
+            held = reconnect.hold(self, connection, session, channel, wire, origin, empty_since)
+            if held is None:
+                return False
+            if held is not channel:
+                channel = held
+                self.live_channel = held
+                if hasattr(channel, "set_video_rate"):
+                    channel.set_video_rate(controller.rate)
+            seq, audio_pts = wire.seq, wire.audio_pts
+            last_audio_wire, last_video_wire = wire.audio_stamp, wire.video_stamp
+            stamp_base = (last_audio_wire + AUDIO_CHUNK_MS
+                          - int(round(channel.session_clock.audio_items * AUDIO_CHUNK_MS)))
+            now = time.monotonic()
+            origin = now - (audio_pts - AUDIO_LEAD_MS) / 1000.0
+            slot_now = int((now - origin) * fps)
+            last_slot = slot_now - 1
+            self._recovery_start = now
+            self.set_session_state(
+                SessionState.RECOVERING,
+                session,
+                reason="channel_data_resumed",
+                starve_duration_s=round(now - empty_since, 4),
+                realigned_origin=round(origin, 4),
+                audio_pts=audio_pts,
+                slot_now=slot_now
+            )
+            window_started = now
+            window_worst_write = 0.0
+            window_video_bytes = 0
+            window_frames = 0
+            window_dropped = 0
+            return True
+
         self.wire_bytes = 0
         while not self.stop.is_set():
-            if channel.failure():
-                raise LiveError("transcode stopped")
+            if (channel.failure() is not None and not channel.audio_pending()
+                    and self.media_filter != "video"):
+                if not hold_on_notice(time.monotonic()):
+                    return
+                continue
             now = time.monotonic()
             self._loops = getattr(self, "_loops", 0) + 1
             # The picture's timestamp is a position on the shared timeline, taken
@@ -1017,6 +1098,8 @@ class AVServer:
                     if taken is None:
                         break
                     block, stamp = taken
+                    stamp += stamp_base
+                    last_audio_wire = stamp
                     self.phase = "live_pcm_send"
                     send_packet(connection, Packet(Kind.PCM, session, seq, stamp, block))
                     self.wire_bytes += len(block) + 24
@@ -1204,6 +1287,8 @@ class AVServer:
                         # for the frame interval itself, so a very slow declared rate
                         # does not stretch the deadline past what one frame is for.
                         frame_deadline = time.monotonic() + max(1.0 / fps, FRAME_WRITE_DEADLINE_S)
+                        video_pts = max(video_pts + stamp_base, last_video_wire + 1)
+                        last_video_wire = video_pts
                         for n, part in enumerate(frame):
                             # Between packets, give the device the chance to say it
                             # has gone: a frame is several writes and the device
@@ -1267,6 +1352,8 @@ class AVServer:
                                 if taken is None:
                                     break
                                 block, stamp = taken
+                                stamp += stamp_base
+                                last_audio_wire = stamp
                                 self.phase = "live_pcm_send"
                                 _audio_t0 = time.monotonic()
                                 send_packet(connection, Packet(Kind.PCM, session, seq,
@@ -1402,56 +1489,9 @@ class AVServer:
                         time.sleep(0.005)
 
                     if not channel.audio_pending() and self.media_filter != "video":
-                        # Sustained starvation gap. Declare STARVED_REBUFFERING.
-                        self.set_session_state(
-                            SessionState.STARVED_REBUFFERING,
-                            session,
-                            reason="channel_audio_empty",
-                            empty_since=round(empty_since, 4)
-                        )
-                        # Device tolerance: AUDIO_SILENCE_MAX_MS is 3000ms.
-                        # Wait up to TV_STARVE_TIMEOUT_S (default 5.0s) before giving up and requesting reconnect.
-                        starve_timeout_s = float(os.environ.get("TV_STARVE_TIMEOUT_S", "5.0"))
-                        while True:
-                            if channel.failure():
-                                raise LiveError("transcode stopped")
-                            if time.monotonic() - empty_since > starve_timeout_s:
-                                raise TimeoutError(f"live audio starved beyond device budget ({starve_timeout_s}s); reconnect for a new origin")
-                            
-                            has_enough = False
-                            if self.media_filter == "video":
-                                has_enough = channel.video_pending()
-                            elif self.media_filter == "audio":
-                                has_enough = len(channel.audio) >= 4
-                            else:
-                                has_enough = channel.video_pending() and len(channel.audio) >= 4
-
-                            if has_enough:
-                                break
-                            if not self._wait_until(connection, time.monotonic() + 0.02, session):
-                                return
-
-                        starve_duration = time.monotonic() - empty_since
-                        now = time.monotonic()
-                        origin = now - (audio_pts - AUDIO_LEAD_MS) / 1000.0
-                        slot_now = int((now - origin) * fps)
-                        # Allow video to be sent immediately upon resume
-                        last_slot = slot_now - 1
-                        self._recovery_start = now
-                        self.set_session_state(
-                            SessionState.RECOVERING,
-                            session,
-                            reason="channel_data_resumed",
-                            starve_duration_s=round(starve_duration, 4),
-                            realigned_origin=round(origin, 4),
-                            audio_pts=audio_pts,
-                            slot_now=slot_now
-                        )
-                        window_started = now
-                        window_worst_write = 0.0
-                        window_video_bytes = 0
-                        window_frames = 0
-                        window_dropped = 0
+                        # Sustained starvation gap: hold the device on the notice.
+                        if not hold_on_notice(empty_since):
+                            return
                     else:
                         time.sleep(0.005)
                     window_frames = 0
