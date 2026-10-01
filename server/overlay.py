@@ -1,8 +1,7 @@
-"""The reconnect notice: a line of text drawn into a frame of palette indices.
+"""重连提示：在调色板索引画面上绘制一行文字。
 
-The text is drawn with a built-in 5x7 bitmap font straight into the index array,
-so it needs no imaging library. Indices refer to the fixed 3-3-2 palette
-(`media.default_palette`): 0 is black, 255 is white, 1 is a dark blue.
+用内置 5x7 点阵字体直接写入索引数组，不依赖图像库。索引对应固定 3-3-2 调色板
+（`media.default_palette`）：0 为黑，255 为白，1 为深蓝。
 """
 
 from __future__ import annotations
@@ -36,11 +35,7 @@ def _text_columns(text: str) -> int:
 
 
 def reconnect_frame(base: bytes | None) -> bytes:
-    """`base` with the notice drawn on a black box at its centre.
-
-    With no `base` -- nothing has been shown yet -- the notice sits on a solid
-    dark-blue frame.
-    """
+    """在 `base` 中央的黑框上绘制提示；`base` 为 None 时用纯深蓝底。"""
     if base is not None and len(base) != frames.FRAME_PIXELS:
         raise ValueError(f"frame is {len(base)} bytes, expected {frames.FRAME_PIXELS}")
     width, height = frames.WIDTH, frames.HEIGHT

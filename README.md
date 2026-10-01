@@ -136,4 +136,4 @@ id | 显示名 | 地址 [| User-Agent]
 python -u -m server.tv_server live --channel ch000 2>&1 | python tools/log_stamp.py server
 ```
 
-按天写入 `<日志目录>/server-YYYYMMDD.log`，目录由 `--dir`、环境变量 `AV_LOG_DIR` 或默认的仓库下 `logs` 目录决定。
+服务端的标准输出与错误输出固定为 UTF-8，在 GBK 控制台中直接查看会显示乱码，请经上述命令写入日志文件后查看。按天写入 `<日志目录>/server-YYYYMMDD.log`，目录由 `--dir`、环境变量 `AV_LOG_DIR` 或默认的仓库下 `logs` 目录决定。

@@ -62,7 +62,7 @@ Python 标准库实现的单客户端局域网服务器，不是公网代理或�
 - **【SHOULD】** 使用类型注解，文件头保留 `from __future__ import annotations`。
 - **【SHOULD】** 函数和类添加简短的 docstring，注释密度与同文件其它同类条目保持一致。
 - **【SHOULD】** 新增第三方依赖前先评估必要性；默认降质方式 `perceptual` 依赖 `numpy`，`TV_DEGRADE=ladder` 只依赖标准库，同步更新 [requirements.txt](requirements.txt)。
-- **【MUST】** 面向用户的控制台提示用简体中文，代码注释与 docstring 用英文。
+- **【MUST】** 控制台提示、代码注释与 docstring 一律用简体中文。
 - **【MUST】** `.py`、`.md` 用 UTF-8，换行符用 LF。
 
 ## 文档规范
@@ -105,7 +105,7 @@ README.md、CLAUDE.md 及代码注释遵守：
 
 ## 关键设计决策
 
-以下结论取自代码注释中的实测记录；标注"旧几何"的数字在当前 320x180 几何下未重测。
+以下结论取自实测；标注"旧几何"的数字在当前 320x180 几何下未重测。
 
 ### 1. 固定调色板、关闭抖动
 

@@ -1,184 +1,65 @@
-"""When a piece of content happened, as opposed to when it turned up here.
+"""内容时间、会话时间，以及画面与声音的配对。
 
-The distinction is the whole of this module, and the project has been wrong
-about it for its entire life. Alignment used to compare **arrival** times: an
-item's position in the session was `time.monotonic() - that_decoder's_start`.
-That number changes when the network stalls, when the reader is slow, when a
-process is descheduled -- none of which are properties of the content. An
-external review built the counterexample: the same picture, delivered 600 ms
-late, stopped matching the sound it belonged to.
+内容时间是条目在节目中的位置，取自解码器自身的 pts（见 pts.py），与到达时间无关，
+投递延迟不会改变画面对应哪段声音。
 
-Two things are wrong with arrival-as-content and they need different fixes.
+两路流出自同一个 ffmpeg 进程、共用一个时钟，偏移为零，每个会话由 `calibrate()` 以
+`BASIS_COMMON_DECODE` 记录一次。`ContentTimeline` 保存该偏移并判断画面相对声音是早、晚
+还是同步；`SessionClock` 把内容时间映射为设备要求的线上时间戳。
 
-**Within one stream**, arrival says nothing about content order or spacing. A
-decoder that is paced at real time emits frame N at N/FPS seconds of content,
-whether that frame arrived on time or three seconds late. So a stream's content
-time is counted, not measured:
-
-    content_ms = items_produced * interval_ms
-
-**Between the two streams**, the counters share no origin: there are two ffmpeg
-processes, each starting its own clock at its own moment. That relationship can
-only be observed once, at the start, and it is a constant thereafter -- it is
-each process's startup latency, and a process that took 300 ms to produce its
-first frame has a 300 ms offset for the rest of the session, not a 300 ms error
-on every frame.
-
-So this module does two separate things and keeps them separate:
-
-- `advance()` counts content forward, from the production rate alone.
-- `calibrate()` observes the origin gap **once**, from the first item of each
-  stream, and refuses to do it again.
-
-What is deliberately NOT here: any use of a per-item arrival time. Once a stream
-is calibrated, an item's content time is fixed at the moment it is pushed and
-never recomputed. That is what makes the review's 600 ms counterexample pass.
-
-The module has no ESP-IDF, no sockets and no ffmpeg. It is arithmetic over
-counters, so the counterexamples can be run in milliseconds on the host rather
-than argued about against a live stream.
+本模块只做时间戳运算，不涉及套接字与 ffmpeg。
 """
 from __future__ import annotations
 
 
 
-# How far apart two streams' content times may be and still be called the same
-# moment. 40 ms is one audio chunk, the granularity the sound is cut into, so
-# anything under it is not an offset a viewer could see.
+# 两路内容时间相差多少以内算同一时刻：一个音频块，即声音的切分粒度。
 DEFAULT_TOLERANCE_MS = 40
 
-# The bases the origin relationship may be measured from, named so that a reader
-# never has to infer which one produced the offset. See `calibrate`.
-#
-# `BASIS_COMMON_DECODE` is the one the server now uses: both streams come out of
-# a single ffmpeg process and carry that process's own timestamps, so their
-# relationship is not measured at all -- it is the same clock by construction.
+# 偏移的来源，随偏移一起记录，见 `calibrate`。
+# 服务端使用 `BASIS_COMMON_DECODE`：两路流出自同一 ffmpeg 进程，时钟相同，偏移为零。
 BASIS_COMMON_DECODE = "one decode, the decoder's own timestamps"
 BASIS_MEDIA_START = "media stream start times"
 
-# How well the two clocks are known to be related. Three states, because an
-# external review was right that two are not enough: "we have not measured it"
-# and "we measured it from something that is not the media" call for different
-# answers, and a single boolean reported the second as the first's opposite.
-#
-# `APPROXIMATE` is deliberately still *usable* -- refusing to pair on it left
-# the screen black, measured, with the sound climbing to 2634 packets while the
-# picture sent none. What it may not do is pass as synchronised.
+# 两路时钟关系的确定程度：未建立、由非媒体来源建立、由媒体自身时间戳建立。
+# 只有最后一种可以声称已同步；`APPROXIMATE` 仍可用于配对，但不能当作实测。
 STATE_UNKNOWN = "unknown"
 STATE_APPROXIMATE = "approximate"
 STATE_FROM_MEDIA = "from media timestamps"
 
 
 def state_of_basis(basis: str) -> str:
-    """Which calibration state a basis establishes.
-
-    Only the two bases that come from the media put a session in the state a
-    synchronisation claim may be made from. A launch-time offset is a real
-    number and a usable one; it is not evidence about the programme.
-    """
+    """某种来源对应的标定状态；只有来自媒体的两种来源才算已同步。"""
     if basis in (BASIS_COMMON_DECODE, BASIS_MEDIA_START):
         return STATE_FROM_MEDIA
     return STATE_APPROXIMATE
 
 
-class Stream:
-    """One stream's content clock: a counter and a fixed origin."""
-
-    __slots__ = ("name", "interval_ms", "count", "origin_ms", "origin_set")
-
-    def __init__(self, name: str, interval_ms: float):
-        if interval_ms <= 0:
-            raise ValueError("interval_ms must be positive")
-        self.name = name
-        self.interval_ms = float(interval_ms)
-        self.count = 0
-        self.origin_ms = 0.0
-        self.origin_set = False
-
-    def take(self) -> float:
-        """Content time of the next item, and count it as produced.
-
-        Called once per item, in production order, by the thread that reads the
-        stream. The value returned is this item's content time for the rest of
-        its life: it is stamped on the item now and never derived again.
-        """
-        stamp = self.origin_ms + self.count * self.interval_ms
-        self.count += 1
-        return stamp
-
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return (f"Stream({self.name!r}, interval={self.interval_ms:.3f}ms, "
-                f"count={self.count}, origin={self.origin_ms:.1f}ms, "
-                f"set={self.origin_set})")
-
-
 class ContentTimeline:
-    """Two streams' content clocks, and the one observation that relates them.
+    """两路流的内容时钟，以及二者的偏移。
 
-    The relationship is calibrated from the first item of each stream and then
-    frozen. Before calibration, `offset_ms` is None and any pairing that needs
-    it must refuse rather than guess -- a session that starts before both
-    streams have produced anything has no basis for saying which content is
-    simultaneous, and pretending otherwise is how a startup gap became a
-    lip-sync error.
+    偏移由 `calibrate()` 设置一次后冻结；此前 `offset_ms` 为 None，需要它的配对一律拒绝而不猜测。
     """
 
-    def __init__(self, video_interval_ms: float, audio_interval_ms: float,
-                 tolerance_ms: float = DEFAULT_TOLERANCE_MS):
-        self.video = Stream("video", video_interval_ms)
-        self.audio = Stream("audio", audio_interval_ms)
+    def __init__(self, tolerance_ms: float = DEFAULT_TOLERANCE_MS):
         self.tolerance_ms = float(tolerance_ms)
-        # Audio content time minus video content time at the observed origin.
+        # 音频内容时间减视频内容时间。
         self.offset_ms: float | None = None
-        # Why calibration did not happen, for the log. Named rather than a bare
-        # boolean because "not calibrated yet" and "refused to recalibrate" are
-        # different states and only one of them is a fault.
+        # 标定情况说明，写入日志。
         self.calibration_note = "not attempted"
-        # What the offset was measured FROM. Never a bare number: the same
-        # 600 ms means "the media says so" or "the scheduler did this" depending
-        # entirely on which basis produced it, and those have opposite meanings.
+        # 偏移的来源，见 BASIS_* 常量。
         self.basis = ""
         self.recalibrations_refused = 0
         self.state = STATE_UNKNOWN
 
-    # -- calibration ------------------------------------------------------
+    # -- 标定 --------------------------------------------------------------
 
     def calibrate(self, video_start_s: float, audio_start_s: float,
                   basis: str = BASIS_MEDIA_START) -> bool:
-        """Relate the two streams from **their own media start times**.
+        """记录两路流的偏移，只生效一次；重复调用被拒绝并计入 `recalibrations_refused`。
 
-        Both ffmpeg processes decode the same source from its beginning, so what
-        a stream's content clock measures is where that stream begins *in the
-        media* -- which is what `ffprobe -show_entries stream=start_time`
-        reports. Two streams whose media starts coincide are simultaneous; a
-        stream that starts 600 ms into the media has 600 ms less content, and
-        that difference belongs to the programme, not to the reader.
-
-        **Two earlier versions of this were wrong, and reviewing why is worth
-        more than the fix.**
-
-        The first used each stream's *first arrival*. That folded delivery
-        latency into the offset: a picture delivered 600 ms late calibrated to
-        -600 ms.
-
-        The second used the two `Popen` timestamps, on the argument that each
-        decoder is paced at real time from its own launch. That is true and it
-        is irrelevant: when a process starts says **when it begins producing**,
-        not **which part of the media it produces**. An external review proved
-        it with real ffmpeg and this project's own `LiveChannel`: the same file,
-        with only the audio process launched 600 ms later, calibrated to +600 ms
-        and discarded the picture's first four frames -- the picture had not
-        changed at all. And a file whose audio genuinely starts at 600 ms
-        calibrated to +0.2 ms, so the real 600 ms offset was erased.
-
-        Both mistakes have one shape: **taking something about the reader as
-        something about the programme.** The arrival is about the network; the
-        launch time is about the scheduler. Neither is in the media. The stream
-        start time is, and it is the only one of the three that ffprobe can
-        answer for both streams at once.
-
-        Returns True if this call set the offset, False if it was already set.
+        `audio_start_s`、`video_start_s` 为两路在共同时钟上的首个时间戳；服务端以
+        `BASIS_COMMON_DECODE` 传入 0.0。本次设置了偏移返回 True，已设置过返回 False。
         """
         if self.offset_ms is not None:
             self.recalibrations_refused += 1
@@ -191,46 +72,22 @@ class ContentTimeline:
 
     @property
     def calibrated(self) -> bool:
-        """Whether the relationship is known to come from the media itself.
-
-        This is the state a synchronisation claim may be made from, and it is
-        **not** the same question as whether the mapping may be used. Asking
-        this one to gate pairing is what left the screen black: on a live source
-        with no start times it is never true, so `pop_video()` refused for ever.
-        """
+        """两路关系是否来自媒体自身的时间戳；这是声称已同步的依据，配对是否可用看 `usable`。"""
         return self.state == STATE_FROM_MEDIA
 
     @property
     def usable(self) -> bool:
-        """Whether the mapping may be used to place items at all.
-
-        True for an approximation as well, because a labelled approximation is
-        strictly better than a black screen -- and the label is what keeps it
-        from being mistaken for the other thing.
-        """
+        """映射是否可用于放置条目；近似值也算可用。"""
         return self.state != STATE_UNKNOWN
 
-    # -- content time -----------------------------------------------------
+    # -- 内容时间 ----------------------------------------------------------
 
 
 
     def audio_in_video_units(self, audio_content_ms: float) -> float:
-        """An audio content time expressed on the video stream's clock.
+        """把音频内容时间换算到视频时钟：加上 `offset_ms`，`video_in_audio_units` 为其逆运算。
 
-        The derivation, because the sign is the whole of it and getting it
-        backwards produces a plausible-looking offset in the wrong direction.
-        A decoder started at wall time `T` emits content `c` at wall time
-        `T + c`. So a thing that happened at wall time `t` has content `t - T`
-        in either stream, and:
-
-            video_content = t - T_v
-            audio_content = t - T_a
-            => audio_content = video_content + (T_a - T_v)
-            => video_content = audio_content - (T_a - T_v)
-
-        `offset_ms` is `T_a - T_v`, measured once from the two arrivals. So an
-        audio time maps to a video time by **adding** it, and the inverse
-        subtracts.
+        同一次解码的偏移为 0，两者都是恒等变换。
         """
         if self.offset_ms is None:
             raise ValueError("the two streams have not been related yet")
@@ -241,23 +98,18 @@ class ContentTimeline:
             raise ValueError("the two streams have not been related yet")
         return video_content_ms - self.offset_ms
 
-    # -- the decision the queues need -------------------------------------
+    # -- 队列所需的判断 ----------------------------------------------------
 
 
     def verdict(self, video_content_ms: float | None,
                 audio_content_ms: float | None) -> str:
-        """Which side is ahead, in words a log can carry.
+        """判断哪一路更靠前，返回可写入日志的词。
 
-        Four answers rather than two, because "the picture is not due yet" and
-        "there is no picture at all" have opposite remedies and looked identical
-        while the decision was a single `None`.
-
-        - `"no-video"` / `"no-audio"`: that queue is empty. Nothing to pair.
-        - `"unrelated"`: both streams have content but their origins have not
-          been related yet. Refuse rather than guess.
-        - `"video-early"`: the picture is ahead of the sound; wait for it.
-        - `"video-late"`: the picture is behind; it has missed its moment.
-        - `"together"`: within tolerance.
+        - `"no-video"` / `"no-audio"`：对应队列为空，无从配对。
+        - `"unrelated"`：两路都有内容但偏移未记录，拒绝而不猜测。
+        - `"video-early"`：画面比声音靠前，等待。
+        - `"video-late"`：画面落后，已错过时机。
+        - `"together"`：在容差内。
         """
         if video_content_ms is None:
             return "no-video"
@@ -265,10 +117,7 @@ class ContentTimeline:
             return "no-audio"
         if self.offset_ms is None:
             return "unrelated"
-        # Positive means the front of the picture queue is content that is
-        # *newer* than the sound being played -- it has not reached its moment
-        # yet, so the answer is to wait. Negative means it is older, which is
-        # the case with no remedy: that moment has passed.
+        # 为正：画面队首比当前声音新，时机未到，等待；为负：已过时，无法补救。
         delta = video_content_ms - self.audio_in_video_units(audio_content_ms)
         if delta > self.tolerance_ms:
             return "video-early"
@@ -278,26 +127,17 @@ class ContentTimeline:
 
 
 class SourceState:
-    """Whether a window with no picture means the source or the link.
+    """区分窗口内没有画面是源停供还是链路拥塞。
 
-    The controller was once able to read an empty window as spare capacity and
-    raise the rate, and the repair for that was a guard. A guard is not a
-    diagnosis: "the source has stopped producing" and "we are sending faster
-    than the link takes" both show as an empty window from the sender's seat,
-    and they call for opposite responses.
-
-    What separates them is whether content is still arriving. A source that has
-    stopped advances neither counter; a congested link keeps both advancing
-    while the send queue grows and nothing leaves.
+    从发送端看两者都表现为空窗口，处置相反。区分依据是内容是否仍在到达：
+    源停供时两路计数都不前进；链路拥塞时计数照常前进，发送队列增长而无数据发出。
     """
 
-    #: Content is flowing and the queues are within bounds.
+    #: 内容正常到达，队列在界内。
     FLOWING = "flowing"
-    #: Content has stopped arriving. Do not touch the rate; there is no
-    #: measurement in this window.
+    #: 内容已停止到达；该窗口没有可用测量，不调整速率。
     STARVED = "starved"
-    #: Content is arriving and the queue is growing past its bound. This is the
-    #: case that wants the rate to come down.
+    #: 内容在到达但队列超界，需要降低速率。
     CONGESTED = "congested"
 
     def __init__(self, stalled_windows_before_starved: int = 2):
@@ -308,16 +148,10 @@ class SourceState:
 
     def observe(self, video_advanced: bool, audio_advanced: bool,
                 queue_over_bound: bool) -> str:
-        """Classify the window that just ended.
+        """对刚结束的窗口分类。
 
-        `video_advanced` and `audio_advanced` say whether either stream produced
-        anything at all. `queue_over_bound` says whether the outgoing queue is
-        holding more content than its bound allows.
-
-        A single quiet window is not starvation: an HLS origin delivers in
-        bursts, and a segment's worth of audio is followed by a wait for the
-        next segment. Only a run of them is a stopped source, which is why this
-        takes more than one window to say so.
+        `video_advanced`、`audio_advanced` 表示该路是否有产出；`queue_over_bound` 表示发送队列是否超界。
+        单个安静窗口不算停供：HLS 源按分片突发送达，连续多个窗口才判定为停供。
         """
         if video_advanced or audio_advanced:
             self._stalled = 0
@@ -333,33 +167,22 @@ class SourceState:
             self.state = self.STARVED
             self.note = f"no content for {self._stalled} windows"
         else:
-            # Not yet enough evidence. Neither starved nor flowing: a window
-            # with no measurement in it, which is what the controller must be
-            # told rather than being told "flowing".
+            # 证据不足：这是一个没有测量值的窗口，不能当作 flowing 告知控制器。
             self.state = self.FLOWING if not queue_over_bound else self.CONGESTED
             self.note = f"quiet window {self._stalled}/{self.stalled_windows_before_starved}"
         return self.state
 
     @property
     def measured(self) -> bool:
-        """Whether the last window carried anything a rate decision may use."""
+        """上一个窗口是否带有可用于速率决策的测量值。"""
         return self.state != self.STARVED
 
 
-# What the mapping can say about a picture. Four answers rather than a stamp or
-# a bare `None`, because the two ways of having no stamp need opposite handling
-# and looked identical while there was only one of them:
-#
-#   * content inside sound the sender dropped has been lost to the viewer, and
-#     the frame is discarded -- keeping it would push the recovery frame's
-#     timestamp up by the size of the hole;
-#   * content whose sound has not been taken yet has not reached its moment,
-#     and the frame is held -- discarding it loses a picture that was going to
-#     be perfectly placeable a moment later.
-#
-# Collapsing them was measured: a frame that should have been dropped was
-# stamped, and the recovery frame that should have got 137 ms was then clamped
-# to 334 ms by the strictly-increasing rule.
+# 映射对一帧画面的判定：
+#   PLACED：已得到会话时间戳；
+#   IN_HOLE：内容落在发送端丢弃的声音区间内，丢弃该帧；
+#   NOT_YET：对应声音尚未取走，保留该帧等待；
+#   NO_ANCHOR：尚未取走任何声音，会话时间无定义。
 VERDICT_PLACED = "placed"
 VERDICT_IN_HOLE = "in-dropped-sound"
 VERDICT_NOT_YET = "sound-not-taken-yet"
@@ -367,46 +190,19 @@ VERDICT_NO_ANCHOR = "no-sound-taken"
 
 
 class SessionClock:
-    """Content time turned into the time the wire carries, gap by gap.
+    """把内容时间按分段映射为线上时间。
 
-    Content time and session time are different quantities and neither may be
-    used as the other.
+    内容时间是条目在节目中的位置，不从 0 开始，随源而变。会话时间是在收听中的位置，从 0 开始，
+    每收一个块恰好前进一个块长；设备要求音频时间戳严格等于上一个加一个块长。
 
-    **Content time** is where a thing sits in the programme. It is not zero at
-    the start of a session and it moves by whatever the source does.
+    发送端丢弃的声音没有被听到，占内容时间而不占会话时间，所以映射是分段的：每次不连续就开始
+    一个新段，段内会话时间与内容时间平行。
 
-    **Session time** is where a thing sits in the listening. It starts at zero
-    and advances by exactly one chunk per chunk received, because that is what
-    the device's playback clock counts: `estimated_pts()` in
-    `main/av_player.c` is `submitted_samples / 16000`, and `av_stream_accept()`
-    refuses a sound packet whose timestamp is not exactly the previous one plus
-    one chunk.
+    画面时间戳取画面自身的内容位置换算到会话时间。时间戳正确是必要条件而非充分条件：
+    实际绘制时刻还取决于发送、缓冲、丢帧与设备播放。本模块不测量观众看到与听到的偏差，
+    `diagnostics()` 也不是这种测量。
 
-    Sound the sender dropped was never heard, so it occupies no session time
-    even though it occupies content time. That is the whole relationship, and
-    it is piecewise rather than a single subtraction: every discontinuity starts
-    a new segment in which session time runs parallel to content time at
-    distance one chunk per chunk.
-
-    **The picture is stamped with its own content position, carried onto this
-    clock.** This is the correction of a defect that an external review found by
-    construction and then measured: the stamp used to be the session position of
-    *the sound the frame was paired with*, so a frame whose content was 333 ms
-    older than that sound was drawn when the sound reached the sound's moment --
-    making the picture 333 ms late, and hiding the fact that it was.
-
-        stamp = session_time_of(the frame's OWN content)
-
-    is what the device needs in order to draw the frame at the right moment,
-    and the frame's content is the only thing that knows what that is. **A
-    correct timestamp is necessary and not sufficient**: when the frame is
-    actually drawn also depends on when it is sent, on buffering and frame
-    drops, and on the device's own playback. Nothing in this module measures
-    what a viewer hears against what they see, and `diagnostics()` below must
-    not be read as though it did.
-
-    `audio_items` remains, and is not the picture's timestamp any more: it is
-    the count of sound blocks taken, which the sender uses to pace itself.
+    `audio_items` 为已取走的音频块数，发送端用它控制节奏。
     """
 
     __slots__ = ("chunk_ms", "tolerance_ms", "audio_items", "video_items", "last_video_ms",
@@ -419,106 +215,64 @@ class SessionClock:
         if chunk_ms <= 0:
             raise ValueError("chunk_ms must be positive")
         self.chunk_ms = float(chunk_ms)
-        # How far the picture's session position may sit from the sound's at the
-        # same instant. It is the same quantity as the sender's pairing
-        # tolerance and is used for a different purpose: see `video`.
+        # 画面的会话位置允许领先该时刻声音位置的幅度，数值与发送端配对容差相同，用于 `placement` 的越界守卫。
         self.tolerance_ms = float(tolerance_ms)
         self.audio_items = 0
         self.video_items = 0
         self.last_video_ms = -1
-        # How far the picture's content sat from the sound it was paired with.
-        # Positive means the picture is ahead.
+        # 配对时画面内容相对声音的差值统计，为正表示画面靠前。
         self.pairs = 0
         self.residual_sum_ms = 0.0
         self.residual_worst_ms = 0.0
-        # Content the source skipped over, in milliseconds, and how often.
+        # 源跳过的内容时长（毫秒）与次数。
         self.content_gap_ms = 0
         self.audio_gaps = 0
-        # Frames the mapping could not place, because their content falls inside
-        # sound the sender dropped. Counted rather than silently extrapolated:
-        # see `session_of`.
+        # 映射无法放置的帧数（落入丢弃区间或时机未到）。
         self.frames_unplaceable = 0
-        # Of those, the ones refused because their content sits in sound that
-        # was dropped, as against the ones merely not due yet. Only this count
-        # is a loss; the other is ordinary waiting.
+        # 其中落入丢弃区间的帧数；只有这部分是损失，其余只是等待。
         self.frames_in_hole = 0
         self.last_verdict = VERDICT_NO_ANCHOR
-        # (content_start, session_start, content_end) per segment. `content_end`
-        # is exclusive and is None while the segment is the newest one, because
-        # the audio it describes is still arriving.
-        #
-        # A segment END is as necessary as its start, and its absence was a
-        # defect an external review measured: with only starts recorded, content
-        # inside a dropped interval was extrapolated along the segment before it
-        # and handed a session time no sound occupies.
+        # 每段为（内容起点，会话起点，内容终点），终点不含；最新一段仍在接收音频，终点为 None。
+        # 终点使丢弃区间内的内容不会沿前一段外推。
         self._segments: list[tuple[float, float, float | None]] = []
         self._prev_audio_content: float | None = None
 
 
     @property
     def anchored(self) -> bool:
-        """Whether any sound has been taken, so session time means anything."""
+        """是否已取走过声音；此前会话时间无意义。"""
         return bool(self._segments)
 
     def session_of(self, content_ms: float) -> float | None:
-        """Session time of a content moment, or None if there is not one.
+        """内容时刻对应的会话时间，没有则返回 None。
 
-        Three cases, and the middle one is why this returns an optional.
-
-        **Inside a segment**: session time runs parallel to content time from
-        that segment's start, so the answer is the distance from it.
-
-        **Inside a gap**: the sound there was produced by the source and dropped
-        by the sender, so the viewer never heard it and the session has no time
-        for it. **There is no answer, and `None` is the answer.** Returning a
-        value by extrapolating the segment before the gap is what an external
-        review caught: a picture at content 4750 ms was given session 4750 ms in
-        a session whose sound had only ever reached 120 ms, and the frames around
-        it pushed the recovery frame's timestamp up by 4.8 seconds.
-
-        **Before the first segment**: the session has not begun, but a picture
-        that arrives before the first sound is the ordinary startup case rather
-        than an error, so the first segment is extended backwards and the result
-        is allowed to be negative -- `video()` clamps it, because a wire
-        timestamp has no way to say "before the start".
+        段内：会话时间与内容时间平行。间隙内：声音已被发送端丢弃，会话中没有对应时间，返回 None。
+        第一段之前：向后延伸第一段，结果可能为负，由 `placement()` 钳制为 0。
         """
         if not self._segments:
             return None
         first = self._segments[0]
         if content_ms < first[0]:
-            # Before the session's first sound. The first segment is extended
-            # backwards so a picture that arrives during startup still has a
-            # place; `video()` clamps the negative result.
+            # 早于会话第一个声音：向后延伸第一段。
             return float(content_ms) - first[0] + first[1]
         for start_content, start_session, end_content in self._segments:
             if start_content <= content_ms and (end_content is None
                                                 or content_ms < end_content):
-                # Inside this segment. The newest one has no end yet and so
-                # extends forward -- but only FORWARD: reaching it does not mean
-                # everything before it belongs to it, which is the case the
-                # check below covers.
+                # 落在本段内；最新一段没有终点，只向前延伸。
                 return float(content_ms) - start_content + start_session
-        # Not inside any segment: the content sits between a closed segment's
-        # end and the next one's start, which is exactly the sound the sender
-        # dropped. There is no session moment here to return.
+        # 不在任何一段内：位于已结束段与下一段之间，即发送端丢弃的声音，没有会话时刻。
         return None
 
     def audio(self, content_ms: float) -> int:
-        """Session timestamp for a sound block, and count it as taken.
+        """返回一个音频块的会话时间戳并计为已取走。
 
-        Contiguous by construction, which the device requires: each block
-        advances the device's clock by exactly one chunk and the timestamp has
-        to say so. A source discontinuity moves the content map without moving
-        this, and is counted in `content_gap_ms` where an operator can see it.
+        时间戳逐块连续（设备要求）；源的不连续只改变内容映射，并计入 `content_gap_ms`。
         """
         content_ms = float(content_ms)
-        # This block's session time, and the number the device will be sent.
-        # Computed before the map is touched, because a segment begins at THIS
-        # block's session time and not one chunk past the previous segment.
+        # 本块的会话时间，先于修改映射计算：新段从本块的会话时间开始。
         value = int(round(self.audio_items * self.chunk_ms))
         if self._prev_audio_content is None:
-            # The anchor: the first sound of the session, whose session time is
-            # zero by definition.
+            # 锚点：会话的第一个声音，会话时间为 0。
             self._segments = [(content_ms, float(value), None)]
         else:
             step = content_ms - self._prev_audio_content
@@ -526,14 +280,11 @@ class SessionClock:
                 missed = int(round(step - self.chunk_ms))
                 self.content_gap_ms += missed
                 self.audio_gaps += 1
-                # Close the segment being left behind, at the end of the sound
-                # that was actually received. Without this the segment has no
-                # far edge and content inside the gap is extrapolated along it.
+                # 在实际收到的声音末尾关闭旧段，避免间隙内的内容沿旧段外推。
                 previous = self._segments[-1]
                 self._segments[-1] = (previous[0], previous[1],
                                       self._prev_audio_content + self.chunk_ms)
-                # And start a new one, running parallel to content from this
-                # block's own session time.
+                # 从本块的会话时间开始新段。
                 self._segments.append((content_ms, float(value), None))
         self._prev_audio_content = content_ms
         self.audio_items += 1
@@ -541,105 +292,47 @@ class SessionClock:
 
     def placement(self, content_ms: float,
                   pending_audio_ms: float | None = None) -> tuple[str, int | None]:
-        """Where a picture belongs, and what to do when it does not belong anywhere.
+        """判定画面的位置，返回（判定，会话时间戳或 None）。
 
-        `pending_audio_ms` is the content position of the next sound block the
-        sender intends to take -- the head of its queue. It is what closes the
-        current segment in time. Without it a gap can only be seen once the
-        sound *after* the gap has been taken, and until then the open segment
-        extends forward across the hole; an external review measured the result:
-        a 280 ms gap whose recovery frame should have been stamped 137 ms was
-        clamped to 334 ms, a 197 ms error, with the refusal counter still at 0.
+        `content_ms` 为画面内容时刻，须已换算到声音时钟（见 `ContentTimeline.video_in_audio_units`）。
+        `pending_audio_ms` 为发送端下一个将取的音频块的内容位置（队首），用于在该块被取走之前
+        提前关闭当前段、发现间隙。
 
-        The verdict separates two states that a bare `None` used to merge.
-        `IN_HOLE` is a loss and the frame goes; `NOT_YET` is ordinary waiting
-        and the frame stays in the queue. Treating the second as the first
-        discards a picture that would have been placeable one block later.
-
-        Returns (verdict, session timestamp or None). See `video()` for the
-        timestamp alone.
-
-        `content_ms` is the picture's content moment expressed on the sound's
-        clock -- see `ContentTimeline.video_in_audio_units`.
-
-        `None` before any sound has been taken, and that is not a placeholder:
-        without an anchor there is no session time, and inventing one would place
-        the picture against a moment the sound never described.
-
-        Strictly increasing, because the device refuses a video timestamp that
-        does not advance. Two pictures whose content maps to the same
-        millisecond are two pictures the device cannot tell apart by time at
-        all, so the tie is broken by one millisecond; this is the only counter
-        left in the mapping and it is bounded by the frame interval.
-
-        Clamped at zero rather than refused: a picture whose content precedes the
-        session's first sound may be drawn at once, and a wire timestamp has no
-        way to express "before the start".
+        `IN_HOLE` 是损失，丢弃该帧；`NOT_YET` 是等待，该帧留在队列中。
+        没有锚点时无会话时间，时间戳为 None。
+        时间戳严格递增（设备拒绝不前进的视频时间戳），相同则加 1 毫秒；钳制为不小于 0。
         """
         self.last_verdict = VERDICT_NO_ANCHOR
         if not self.anchored:
             return VERDICT_NO_ANCHOR, None
-        # The open segment's forward edge, and whether the next sound continues
-        # it. Closing the segment here -- before the sound after the gap has
-        # been taken -- is the whole of the short-gap fix: the head of the
-        # audio queue is already visible while the segment is still open, so
-        # the hole is known in time rather than one block too late.
+        # 当前段的前沿，以及下一个声音是否接续它；队首在被取走前就可见，因此能提前发现间隙。
         edge = None
         if self._prev_audio_content is not None and pending_audio_ms is not None:
             edge = self._prev_audio_content + self.chunk_ms
             if pending_audio_ms <= edge:
-                # The next sound continues this segment; it simply extends.
+                # 下一个声音接续本段，段直接延伸。
                 edge = None
         if edge is not None and content_ms >= edge:
             if content_ms < pending_audio_ms:
-                # Inside sound the sender dropped. The viewer never heard this
-                # moment, so there is no session time to draw it at.
+                # 落入发送端丢弃的声音，没有可用的会话时间。
                 self.frames_unplaceable += 1
                 self.frames_in_hole += 1
                 self.last_verdict = VERDICT_IN_HOLE
                 return VERDICT_IN_HOLE, None
-            # Past the next sound as well, so its moment has not arrived. The
-            # frame is held, not discarded.
+            # 连下一个声音也已越过，时机未到，保留该帧。
             self.last_verdict = VERDICT_NOT_YET
             return VERDICT_NOT_YET, None
         place = self.session_of(content_ms)
         if place is not None and place > (self.audio_items * self.chunk_ms
                                           + self.tolerance_ms):
-            # A second guard, for the case `session_of` cannot see in time.
-            #
-            # A gap is only *known* once the sound after it arrives, and that
-            # sound arrives at the head of the queue -- so a frame paired just
-            # before that moment is stamped while the segment is still open and
-            # still extending forward across the hole. An external review
-            # measured the result: three frames whose content sat inside a
-            # 4.88 s hole were stamped 4750, 4833 and 4917, and the recovery
-            # frame, mapping correctly to 120 ms, was then clamped to 4918 by
-            # the strictly-increasing rule. One refused frame would have
-            # prevented all 4798 ms of it.
-            #
-            # **The test is one-sided on purpose.** A frame may be *behind* the
-            # sound the session has taken -- that is the normal state, because
-            # the sound runs ahead of the picture by the queue depth -- but it
-            # may never be *ahead* of it. Nothing has been heard that has not
-            # been taken, so a picture claiming to sit later than the newest
-            # sound is claiming a moment that does not exist yet, and the only
-            # way the map produces that is by extrapolating across a hole.
-            #
-            # The allowance above the head is the pairing tolerance, because a
-            # picture is paired *within* tolerance of the sound at the head and
-            # the head has not been taken yet. An earlier version compared the
-            # absolute distance instead and refused healthy frames 400 ms behind
-            # the sound, which is ordinary queue depth rather than a fault.
+            # 第二道守卫，针对尚不可见的间隙：间隙之后的声音被取走前，此刻配对的帧会沿仍未关闭的段跨过空洞。
+            # 单向判断：画面可以落后于已取走的声音（声音比画面靠前一个队列深度），但不能超前；
+            # 超前的余量取配对容差，因为队首尚未取走。
             self.frames_unplaceable += 1
             self.last_verdict = VERDICT_NOT_YET
             return VERDICT_NOT_YET, None
         if place is None:
-            # The content sits inside sound the sender dropped, so there is no
-            # session moment for it. Refusing is the answer and it is load
-            # bearing: the alternative -- letting a large backward step through
-            # -- is what produced a 4798 ms error on the recovery frame, because
-            # the monotonic clamp below then pushed 120 ms up to follow a
-            # picture that should never have been given a timestamp at all.
+            # 内容落入丢弃区间，没有会话时刻；此处若发出时间戳，会使下面的严格递增钳制超过恢复帧。
             self.frames_unplaceable += 1
             self.frames_in_hole += 1
             self.last_verdict = VERDICT_IN_HOLE
@@ -656,32 +349,13 @@ class SessionClock:
 
     def video(self, content_ms: float,
               pending_audio_ms: float | None = None) -> int | None:
-        """The session timestamp for a picture, or None.
-
-        The timestamp alone, for callers that only send placeable frames. The
-        sender uses `placement()` instead, because it also has to tell a frame
-        whose sound was dropped from one whose sound is merely not due yet.
-        """
+        """只返回画面的会话时间戳，无则 None；发送端需要区分丢弃与等待，用 `placement()`。"""
         return self.placement(content_ms, pending_audio_ms)[1]
 
     def note_pair(self, video_content_ms: float, audio_content_ms: float) -> None:
-        """Record how far the picture's content sat from the sound's, in ms.
+        """记录配对时画面内容相对声音的差值（毫秒），为正表示画面靠前；两个参数在同一时钟上。
 
-        Positive means the picture is ahead. Both arguments are on the sound's
-        clock. Called where the pairing decision is made, so the two numbers
-        describe one instant.
-
-        This is a residual and not a count, and the difference matters. A count
-        of pairs that were not exactly equal fires on ordinary jitter, because a
-        picture is *placed within a tolerance* of its sound and never exactly on
-        it -- a stream in perfect health produced nine such "behind" pairs on the
-        first run of this counter, which is a number that cannot be acted on.
-
-        It measures **queue depth difference**, not lip-sync error: the two are
-        placed on one clock by `audio()` and `video()` above, so a constant
-        residual means the picture queue is that much deeper than the sound's,
-        not that the viewer sees a mismatch. A residual that *walks* is the
-        thing to watch.
+        该差值反映两个队列的深度差，不是唇音偏差：恒定表示画面队列多存了这么多内容，需要关注的是它持续漂移。
         """
         residual = float(video_content_ms) - float(audio_content_ms)
         self.pairs += 1
@@ -690,7 +364,7 @@ class SessionClock:
             self.residual_worst_ms = residual
 
     def diagnostics(self) -> str:
-        """One line for the periodic report."""
+        """周期报告用的一行统计。"""
         mean = self.residual_sum_ms / self.pairs if self.pairs else 0.0
         return (f"audio={self.audio_items} video={self.video_items}"
                 f" pair={self.pairs}"

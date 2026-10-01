@@ -1,59 +1,40 @@
-"""Byte-rate control for a live session.
+"""直播会话的字节率控制。
 
-The picture's frame rate is fixed for a session; what moves is the byte rate the
-frames are fitted into (`ByteRate`). The controller is given what the last window
-of sending cost -- the slowest write and the frames given up -- and answers with
-a byte rate for `frames.ByteBudget` to spend. It holds no socket, no clock and no
-state that outlives a session.
+帧率在会话内固定，变化的只有帧所适配的字节率（`ByteRate`）。控制器接收上一窗口的
+发送开销（最慢写入与放弃的帧数），给出供 `frames.ByteBudget` 使用的字节率；
+不持有 socket、时钟或跨会话状态。
 """
 
 from __future__ import annotations
 
 import os
 
-# Nominal rate used to size the pre-buffer, in frames per second of reserve.
+# 预缓冲按此名义帧率折算储备量。
 START_FPS = int(os.environ.get("TV_START_FPS", "5"))
 
-# Write times (ms) above which the link is judged to be filling up, and below which it has room.
-# The gap is hysteresis: a single threshold would oscillate.
+# 写入耗时（毫秒）：高于 SLOW 判定链路在积压，低于 FAST 判定有余量；两者之间为滞回区间。
 SLOW_WRITE_MS = 250.0
 FAST_WRITE_MS = 120.0
 
-# Comfortable windows in a row needed before the rate goes up; down is immediate.
+# 连续多少个宽松窗口后才上调字节率；下调立即生效。
 WINDOWS_BEFORE_UP = 2
 
 
-# Adapting the byte rate is opt-in (TV_ADAPTIVE=1); by default it is held at the target.
+# 自适应字节率默认关闭，TV_ADAPTIVE=1 开启。
 ADAPTIVE = os.environ.get("TV_ADAPTIVE", "0") == "1"
 
 
-# --- Fixed frame rate, variable byte rate -------------------------------------
+# --- 帧率固定，字节率可变 ---
 #
-# The sender does not choose how many pictures a second to send. The
-# rate is the source's own and is held for the whole session, because a rate that
-# moves is a stutter the viewer sees, and a frame that carries fewer changed
-# stripes is a softer picture the viewer mostly does not. What moves instead is
-# how many bytes the pictures are allowed to cost, and that is the whole job of
-# `ByteRate`: it is given what the last window cost and answers with a byte rate
-# for `frames.ByteBudget` to spend.
-#
-# The target is a size per FRAME, and the byte rate follows from the frame rate:
-# FRAME_BYTES * fps, so a 25 fps channel is held to 500 kB/s and a 30 fps one to
-# 600 kB/s. It is what the session runs at when ADAPTIVE is off, which is the
-# default, and every frame is fitted into it (frames.encode_within) rather than
-# merely capped by it. TV_RATE_START sets a byte rate directly instead, whatever
-# the frame rate.
-#
-# MIN and MAX only bound the adaptive controller and have no effect in the fixed
-# mode. MAX defaults to START because the adaptive mode is not the one being
-# tuned; raise it together with TV_ADAPTIVE=1 to let the controller climb.
-# Each can be overridden without editing a file.
+# 目标按帧计：字节率 = FRAME_BYTES * fps，自适应关闭时会话固定使用它；
+# TV_RATE_START 直接指定字节率，不随帧率变化。
+# MIN 与 MAX 只限定自适应范围；MAX 默认等于起始值，需配合 TV_ADAPTIVE=1 调高才会上探。
 FRAME_BYTES = int(os.environ.get("TV_FRAME_BYTES", "20000"))
 MIN_RATE_BPS = int(os.environ.get("TV_RATE_MIN", "100000"))
 
 
 def start_rate(fps: int) -> int:
-    """The fixed byte rate for a picture at `fps`."""
+    """`fps` 下的固定字节率。"""
     explicit = os.environ.get("TV_RATE_START")
     return int(explicit) if explicit else FRAME_BYTES * fps
 
@@ -68,14 +49,11 @@ RATE_STEP_UP = 1.05
 
 
 class ByteRate:
-    """Decides the picture's byte rate; the picture's frame rate is a constant.
+    """决定画面字节率，帧率恒定。
 
-    Signals are the slowest write in the window and the frames the sender itself
-    gave up. Down at once, up only after `WINDOWS_BEFORE_UP` windows in a row of
-    evidence. A window is only proof of spare capacity if the link was actually being used: a still studio shot sends
-    almost nothing, every write in it is instant, and raising the rate on that
-    would open the gate for the next cut to spend it all at once. So the rate only
-    climbs in a window that used at least 80% of it and still wrote quickly.
+    依据窗口内最慢写入与发送端自己放弃的帧数：立即下调，连续
+    `WINDOWS_BEFORE_UP` 个窗口宽松后才上调。上调还要求窗口用掉至少 80% 的字节率，
+    静止画面几乎不发数据，写入再快也不能证明链路有余量。
     """
 
     def __init__(self, fps: int, start: int | None = None,
@@ -106,11 +84,7 @@ class ByteRate:
     def observe(self, video_bytes: int, worst_write_ms: float,
                 dropped: int = 0, frames: int = 0,
                 window_s: float = 1.0) -> int:
-        """Take one window's measurements; return the frame rate, which never moves.
-
-        The return value is there so the sender's loop reads the same either way.
-        The byte rate is `self.rate` afterwards.
-        """
+        """记录一个窗口的测量值，返回恒定的帧率；字节率见 `self.rate`。"""
         self.bytes, self.worst_write_ms, self.dropped = video_bytes, worst_write_ms, dropped
         self.window_s = max(0.05, window_s)
         drop_running = bool(dropped) and self._dropped_last_window
@@ -119,7 +93,7 @@ class ByteRate:
             return self.fps
         measured = bool(frames or video_bytes or worst_write_ms > 0.0 or dropped)
         if not measured:
-            # An empty window says the source stopped, not that the link has room.
+            # 空窗口表示源停供，不代表链路有余量。
             self._comfortable = 0
             self.reason = "no measurement in the window; holding"
             return self.fps
@@ -136,7 +110,7 @@ class ByteRate:
                 self.reason += "; already at the floor"
             return self.fps
         if dropped:
-            # One isolated loss is what a burst at the working point costs.
+            # 孤立的一次丢帧属于工作点附近的正常突发。
             self.reason = "dropped %d frame%s" % (dropped, "" if dropped == 1 else "s")
             return self.fps
         if worst_write_ms < FAST_WRITE_MS and achieved >= self.rate * 0.8:

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Read lines on stdin and write them with local time to LOGDIR/<name>-YYYYMMDD.log,
-one file per day. LOGDIR defaults to <repo>/logs, overridden by AV_LOG_DIR or --dir.
+"""逐行读取标准输入，加本地时间戳后写入 LOGDIR/<name>-YYYYMMDD.log，每天一个文件。
+LOGDIR 默认为 <repo>/logs，可用 AV_LOG_DIR 或 --dir 覆盖。
 
     python -u -m server.tv_server live --channel <id> --bind <addr> 2>&1 | python tools/log_stamp.py server [--dir LOGDIR]
 
-Search the server log for: STATE_CHANGE, Traceback, ProtocolError, LiveError,
-channel_audio_empty, "source=starved".
+排查时在服务端日志中搜索：STATE_CHANGE、Traceback、ProtocolError、LiveError、
+channel_audio_empty、"source=starved"。
 """
 import datetime as dt
 import os
