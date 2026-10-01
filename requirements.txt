@@ -1,0 +1,2 @@
+# Optional. The server runs on the standard library alone.
+numpy        # perceptual give-and-take for frames that miss the byte target (TV_PERCEPTUAL)
